@@ -4,7 +4,6 @@ import {
   AccessoryPlugin,
   Logging,
   Service,
-  Characteristic,
   AccessoryConfig,
 } from "homebridge";
 
