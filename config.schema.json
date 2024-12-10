@@ -1,16 +1,39 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
-  "pluginType": "platform",
+  "pluginAlias": "ShellyHNT",
+  "pluginType": "accessory",
   "singular": true,
-  "strictValidation": false,
   "schema": {
     "type": "object",
     "properties": {
       "name": {
-        "title": "Name",
+        "title": "Accessory Name",
         "type": "string",
         "required": true,
-        "default": "Example Dynamic Platform"
+        "default": "Shelly H&T"
+      },
+      "deviceId": {
+        "title": "Shelly Device Id",
+        "type": "string",
+        "required": true,
+        "default": "67f4d2"
+      },
+      "authorizationKey": {
+        "title": "Shelly Cloud Authorization Key",
+        "type": "string",
+        "required": true,
+        "default": ""
+      },
+      "serverUrl": {
+        "title": "Shelly Cloud Server URL",
+        "type": "string",
+        "required": true,
+        "default": "https://shelly-126-eu.shelly.cloud"
+      },
+      "pollingInterval": {
+        "title": "Polling Interval (ms)",
+        "type": "integer",
+        "required": false,
+        "default": 60000
       }
     }
   }

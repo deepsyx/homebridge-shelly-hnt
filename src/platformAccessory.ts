@@ -1,148 +1,180 @@
-import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
+import axios from "axios";
+import {
+  API,
+  AccessoryPlugin,
+  Logging,
+  Service,
+  Characteristic,
+  AccessoryConfig,
+} from "homebridge";
 
-import type { ExampleHomebridgePlatform } from './platform.js';
+type HNTFirstGenData = {
+  tmp: { tC: number };
+  hum: { value: number };
+  bat: { value: number };
+};
 
-/**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
- */
-export class ExamplePlatformAccessory {
-  private service: Service;
+type HNTThirdGenData = {
+  "temperature:0": { tC: number };
+  "humidity:0": { rh: number };
+  "devicepower:0": { battery: { percent: number } };
+};
 
-  /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
-   */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
-  };
+type DeviceData = HNTFirstGenData & HNTThirdGenData;
 
-  constructor(
-    private readonly platform: ExampleHomebridgePlatform,
-    private readonly accessory: PlatformAccessory,
-  ) {
-    // set accessory information
-    this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+interface ShellyHNTConfig extends AccessoryConfig {
+  serverUrl: string;
+  deviceId: string;
+  authorizationKey: string;
+  pollingInterval?: number;
+}
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
+export class ShellyHNTAccessory implements AccessoryPlugin {
+  private readonly log: Logging;
+  private readonly config: ShellyHNTConfig;
+  private readonly api: API;
 
-    if (accessory.context.device.CustomService) {
-      // This is only required when using Custom Services and Characteristics not support by HomeKit
-      this.service = this.accessory.getService(this.platform.CustomServices[accessory.context.device.CustomService]) ||
-        this.accessory.addService(this.platform.CustomServices[accessory.context.device.CustomService]);
-    } else {
-      this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
+  private deviceData: DeviceData | null = null;
+  private readonly temperatureService: Service;
+  private readonly humidityService: Service;
+
+  constructor(log: Logging, config: AccessoryConfig, api: API) {
+    this.log = log;
+    this.log("Setup started");
+
+    this.deviceData = null;
+
+    this.api = api;
+
+    const name = config.name || "Shelly H&T";
+
+    if (
+      !("serverUrl" in config) ||
+      !("deviceId" in config) ||
+      !("authorizationKey" in config)
+    ) {
+      throw new Error(
+        "Invalid configuration for ShellyHNTAccessory! Make sure serverUrl, deviceId and authorizationKey are provided"
+      );
     }
 
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
+    this.config = config as ShellyHNTConfig;
 
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
+    this.temperatureService = new api.hap.Service.TemperatureSensor(name);
+    this.humidityService = new api.hap.Service.HumiditySensor(name);
 
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this)) // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this)); // GET - bind to the `getOn` method below
+    this.temperatureService
+      .getCharacteristic(api.hap.Characteristic.CurrentTemperature)
+      .onGet(this.getTemperature.bind(this));
 
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this)); // SET - bind to the `setBrightness` method below
+    this.temperatureService
+      .getCharacteristic(api.hap.Characteristic.StatusLowBattery)
+      .onGet(this.getBatteryStatus.bind(this));
 
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same subtype id.)
-     */
+    this.humidityService
+      .getCharacteristic(api.hap.Characteristic.CurrentRelativeHumidity)
+      .onGet(this.getHumidity.bind(this));
 
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
+    this.humidityService
+      .getCharacteristic(api.hap.Characteristic.StatusLowBattery)
+      .onGet(this.getBatteryStatus.bind(this));
 
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
+    this.fetchData();
 
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
     setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
+      this.fetchData();
+    }, config.pollingInterval || 30000);
 
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
+    this.log("Setup completed");
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
-   */
-  async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
+  async fetchData() {
+    try {
+      const response = await axios.post(
+        `${this.config.serverUrl}/device/status`,
+        {
+          id: this.config.deviceId,
+          auth_key: this.config.authorizationKey,
+        }
+      );
 
-    this.platform.log.debug('Set Characteristic On ->', value);
+      this.deviceData = response.data.data.device_status as DeviceData;
+
+      this.temperatureService
+        .getCharacteristic(this.api.hap.Characteristic.CurrentTemperature)
+        .updateValue(this.getTemperatureFromDeviceData(this.deviceData));
+
+      this.humidityService
+        .getCharacteristic(this.api.hap.Characteristic.CurrentRelativeHumidity)
+        .updateValue(this.getHumidityFromDeviceData(this.deviceData));
+    } catch (error) {
+      this.log.error("Error fetching data from HTTP server:", error);
+    }
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possible. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-   * In this case, you may decide not to implement `onGet` handlers, which may speed up
-   * the responsiveness of your device in the Home app.
+  async getBatteryStatus() {
+    if (!this.deviceData) {
+      throw new Error("Temperature data unavailable");
+    }
 
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
-  async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
+    if (this.deviceData.bat && this.deviceData.bat.value < 10) {
+      // support for first gen H&T
+      return this.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW;
+    }
 
-    this.platform.log.debug('Get Characteristic On ->', isOn);
+    if (this.deviceData["devicepower:0"]?.battery?.percent < 10) {
+      // support for third gen H&T
+      return this.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW;
+    }
 
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-    return isOn;
+    return this.api.hap.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL;
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
-  async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
+  private getTemperatureFromDeviceData(deviceData: DeviceData) {
+    if (deviceData.tmp) {
+      // support for first gen H&T
+      return deviceData.tmp.tC;
+    }
 
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+    if (deviceData["temperature:0"]) {
+      // support for third gen H&T
+      return deviceData["temperature:0"].tC;
+    }
+
+    throw new Error("Invalid response data shape");
+  }
+
+  async getTemperature() {
+    if (!this.deviceData) {
+      throw new Error("Temperature data unavailable");
+    }
+
+    return this.getTemperatureFromDeviceData(this.deviceData);
+  }
+
+  private getHumidityFromDeviceData(deviceData: DeviceData) {
+    if (deviceData.hum) {
+      // support for first gen H&T
+      return deviceData.hum.value;
+    }
+
+    if (deviceData["humidity:0"]) {
+      // support for third gen H&T
+      return deviceData["humidity:0"].rh;
+    }
+
+    throw new Error("Invalid response data shape");
+  }
+
+  async getHumidity() {
+    if (!this.deviceData) {
+      throw new Error("Humidity data unavailable");
+    }
+
+    return this.getHumidityFromDeviceData(this.deviceData);
+  }
+
+  getServices() {
+    return [this.temperatureService, this.humidityService];
   }
 }
